@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import List, Optional, Protocol, Tuple
 
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.transformer.moe.deferred_moe_buffer import (
+    DeferredMoEBuffer,
+    MoEDrainedPayload,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -300,6 +304,20 @@ class MoELayer(BaseMoELayer):
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
             )
 
+        self.deferred_buffer = None  # Routed-token buffer (`DeferredMoEBuffer`) when deferred enabled.
+        if config.moe_deferred_dispatch_enabled:
+            eps = parallel_state.get_expert_model_parallel_world_size()
+            if eps is None or eps <= 0:
+                eps = 1
+            self.deferred_buffer = DeferredMoEBuffer(
+                batch_mode=config.moe_deferred_batch_mode,
+                target_tokens_global=config.moe_deferred_target_tokens,
+                bin_target_tokens=config.moe_deferred_bin_target_tokens,
+                bin_key_mode=config.moe_deferred_bin_key_mode,
+                num_experts=config.num_moe_experts,
+                ep_parallel_size=eps,
+            )
+
         # Initialize experts
         self.experts = self.submodules.experts(
             self.num_local_experts, self.config, pg_collection=pg_collection
@@ -514,6 +532,134 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
+    @staticmethod
+    def _sequence_spans(sequence_length: int, strip_requested: int) -> List[Tuple[int, int]]:
+        """Partition `[0, sequence_length)` into up to `strip_requested` contiguous spans."""
+        if sequence_length <= 0:
+            return []
+        strips = max(1, min(sequence_length, int(strip_requested)))
+        base = sequence_length // strips
+        rem = sequence_length % strips
+        spans: List[Tuple[int, int]] = []
+        start = 0
+        for i in range(strips):
+            ln = base + (1 if i < rem else 0)
+            if ln > 0:
+                spans.append((start, start + ln))
+                start += ln
+        return spans
+
+    def _expert_subgraph_through_token_combine(
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expert path ending right after `token_combine` (before shared/latent second half of postprocess)."""
+        hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+        hidden_states, probs = self.dispatch(hidden_states, probs)
+        routed_out, mlp_bias = self.routed_experts_compute(hidden_states, probs)
+        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        return self.combine(routed_out)
+
+    def _drain_payloads_through_token_combine(
+        self,
+        payloads: List[MoEDrainedPayload],
+        segment_log: List[Tuple[int, int, torch.Tensor]],
+    ) -> None:
+        for pl in payloads:
+            out_tc = self._expert_subgraph_through_token_combine(
+                pl.hidden_states,
+                pl.probs,
+                pl.routing_map,
+            )
+            segment_log.append((pl.seq_span_start, pl.seq_span_end_exclusive, out_tc))
+
+    def _stitch_token_combine_output(
+        self,
+        *,
+        seq_len: int,
+        batch_size: int,
+        hidden_size: int,
+        template: torch.Tensor,
+        segments: List[Tuple[int, int, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Rebuild `[seq_len, batch, hidden]` after independent `token_combine` chunk runs."""
+        out = torch.empty(
+            (seq_len, batch_size, hidden_size),
+            dtype=template.dtype,
+            device=template.device,
+        )
+        spans = sorted(segments, key=lambda x: x[0])
+        if not spans:
+            raise RuntimeError('deferred MoE produced no routed segments — configuration error')
+        if spans[0][0] != 0:
+            raise RuntimeError(
+                'deferred MoE segments do not cover the full sequence span from zero'
+            )
+        if spans[-1][1] != seq_len:
+            raise RuntimeError('deferred MoE segments do not cover the trailing sequence tokens')
+        for (_, e0), (s1, _) in zip(spans[:-1], spans[1:]):
+            if e0 != s1:
+                raise RuntimeError(f'deferred MoE segment discontinuity {(e0, s1)}')
+        for s, e, chunk in spans:
+            out[s:e].copy_(chunk)
+        return out
+
+    def _forward_with_deferred_buffer(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        shared_expert_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        assert self.deferred_buffer is not None
+        seq_len, batch_size, hidden_size = hidden_states.shape
+        buf = self.deferred_buffer
+        if buf.total_pending_token_rows_global() > 0:
+            raise RuntimeError(
+                'Deferred MoE buffer is non-empty at layer forward entry; previous forward '
+                'may have exited early or buffering across forwards requires '
+                '`moe_deferred_flush_tokens_at_forward_end=False` external flush (not wired).'
+            )
+
+        spanning_outputs: List[Tuple[int, int, torch.Tensor]] = []
+
+        for s_lo, s_hi in self._sequence_spans(seq_len, self.config.moe_deferred_sequence_strip_count):
+            slab = hidden_states[s_lo:s_hi]
+            mask_slab = padding_mask[s_lo:s_hi] if padding_mask is not None else None
+            probs_s, routing_s = self.route(slab, mask_slab)
+            buf.push_routed_piece(
+                seq_start=s_lo,
+                seq_end_exclusive=s_hi,
+                hidden_states=slab.contiguous(),
+                probs=probs_s,
+                routing_map=routing_s,
+            )
+            self._drain_payloads_through_token_combine(buf.drain_ready_payloads_mid_forward(), spanning_outputs)
+
+        if self.config.moe_deferred_flush_tokens_at_forward_end:
+            self._drain_payloads_through_token_combine(buf.drain_all_remaining(), spanning_outputs)
+        else:
+            raise NotImplementedError(
+                'Leaving deferred MoE tokens buffered across forwards requires external flush '
+                '(set `TransformerConfig.moe_deferred_flush_tokens_at_forward_end=True` for '
+                'per-forward completion).'
+            )
+
+        stitched = self._stitch_token_combine_output(
+            seq_len=seq_len,
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+            template=hidden_states,
+            segments=spanning_outputs,
+        )
+
+        output = self.postprocess(stitched, shared_expert_output)
+
+        buf.clear()
+
+        return output
+
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
 
@@ -548,12 +694,40 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        if getattr(self.config, 'moe_deferred_dispatch_enabled', False):
+            if self.moe_layer_recompute and self.training:
+                raise RuntimeError(
+                    '`moe_deferred_dispatch_enabled` is incompatible with selective MoE recomputation '
+                    '("moe" in `recompute_modules`): disable deferred dispatch or recomputation.'
+                )
+            if self.config.overlap_dispatch_backward_with_experts_wgrad:
+                raise RuntimeError(
+                    '`moe_deferred_dispatch_enabled` requires '
+                    '`overlap_dispatch_backward_with_experts_wgrad=False`.'
+                )
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            shared_expert_output = None
+
+            if self.config.moe_deferred_dispatch_enabled:
+                if intermediate_tensors is not None:
+                    raise RuntimeError(
+                        'Partial MoE CUDA graph capture with deferred dispatch is unsupported '
+                        '(`intermediate_tensors` must stay None when '
+                        '`moe_deferred_dispatch_enabled` is True).'
+                    )
+                if "route" not in self.fwd_execution_map:
+                    raise RuntimeError('Deferred dispatch requires "route" in `fwd_execution_map`.')
+                shared_expert_output = self.shared_experts_compute(hidden_states)
+                routed_out_full = self._forward_with_deferred_buffer(
+                    hidden_states, padding_mask, shared_expert_output
+                )
+                return routed_out_full, None
+
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)

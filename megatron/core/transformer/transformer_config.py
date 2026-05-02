@@ -757,6 +757,35 @@ class TransformerConfig(ModelParallelConfig):
     (`token_packing.pre_dispatch_pack_tokens`) before EP/TP collective dispatch. Default False
     preserves legacy behaviour."""
 
+    moe_deferred_dispatch_enabled: bool = False
+    """If True, `MoELayer` may defer expert dispatch/combine until routed tokens accumulate
+    in a buffer (`DeferredMoEBuffer`). Router outputs are buffered; preprocess/dispatch/combine
+    run on drained payloads when thresholds are met. Default False preserves stock fused forward."""
+
+    moe_deferred_batch_mode: Literal['global_pool', 'binned'] = "global_pool"
+    """Buffering strategy for deferred MoE dispatch: concatenate all routed chunks into one pool,
+    or partition rows into bins keyed by coarse routing-derived keys."""
+
+    moe_deferred_target_tokens: int = 4096
+    """For `global_pool`: minimum total routed token rows queued before emitting a preemptive drain
+    (mid-forward). Pending rows are merged in sequence order."""
+
+    moe_deferred_bin_target_tokens: int = 512
+    """For `binned`: per-bin queued token rows threshold before emitting that bin."""
+
+    moe_deferred_bin_key_mode: Literal['exact_topk', 'primary_expert', 'ep_rank_set_hash'] = (
+        "primary_expert"
+    )
+    """How to derive bin keys inside `DeferredMoEBuffer` (implementation is GPU-friendly/coarse rows)."""
+
+    moe_deferred_sequence_strip_count: int = 1
+    """Partitions sequence length within one forward pass into up to N contiguous stripes.
+    Each stripe is routed and pushed independently (strip_count==1 disables striping)."""
+
+    moe_deferred_flush_tokens_at_forward_end: bool = True
+    """If True, always drain buffered tokens still pending at end of forward (recommended for
+    training so each layer returns aligned activations without cross-batch dependencies)."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
