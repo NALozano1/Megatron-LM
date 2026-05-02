@@ -752,6 +752,11 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
+    moe_pre_dispatch_packing_enabled: bool = False
+    """If True, apply optional token-row packing in the all-gather dispatcher preprocess
+    (`token_packing.pre_dispatch_pack_tokens`) before EP/TP collective dispatch. Default False
+    preserves legacy behaviour."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 

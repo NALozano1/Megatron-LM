@@ -41,6 +41,7 @@ from megatron.core.tensor_parallel import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
+from megatron.core.transformer.moe.token_packing import pre_dispatch_pack_tokens
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
 
@@ -447,6 +448,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         self.hidden_shape = hidden_states.shape
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        hidden_states, routing_map, probs = pre_dispatch_pack_tokens(
+            self.config, hidden_states, routing_map, probs
+        )
         self._local_tokens = hidden_states.shape[0]
         self.routing_map = routing_map
         return hidden_states, probs

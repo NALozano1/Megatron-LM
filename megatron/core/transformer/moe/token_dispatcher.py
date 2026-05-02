@@ -34,6 +34,7 @@ from megatron.core.transformer.moe.moe_utils import (
     sort_chunks_by_idxs,
     unpermute,
 )
+from megatron.core.transformer.moe.token_packing import pre_dispatch_pack_tokens
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -253,6 +254,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.hidden_shape = hidden_states.shape
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        hidden_states, routing_map, probs = pre_dispatch_pack_tokens(
+            self.config, hidden_states, routing_map, probs
+        )
         self.routing_map = routing_map
         return hidden_states, probs
 
@@ -618,6 +622,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        hidden_states, routing_map, probs = pre_dispatch_pack_tokens(
+            self.config, hidden_states, routing_map, probs
+        )
+        self.routing_map = routing_map
+        self.probs = probs
 
         if self.config.moe_router_padding_for_quantization:
             pad_multiple = get_align_size_for_quantization(self.config)
@@ -1461,6 +1470,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        hidden_states, routing_map, probs = pre_dispatch_pack_tokens(
+            self.config, hidden_states, routing_map, probs
+        )
 
         # Initialize metadata
         routing_map, probs = self._initialize_metadata(routing_map, probs)
