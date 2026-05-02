@@ -1,0 +1,12 @@
+# Minimal dependencies for importing Megatron-LM tests (conftest pulls megatron.training).
+# Torch: for CPU wheels on Windows/Linux use:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Then (or standalone if torch already satisfies):
+#   pip install -r requirements.txt
+
+torch>=2.6.0
+numpy>=1.24
+packaging>=24.2
+pytest>=7.0
+omegaconf>=2.3
+absl-py>=1.4.0
